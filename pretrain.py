@@ -16,6 +16,8 @@ import torch
 
 from model import LlamaForCausalLM, LlamaConfig
 
+accelerator = Accelerator()
+
 
 @dataclass
 class ScriptArguments:
@@ -33,49 +35,94 @@ class GenerationCallback(TrainerCallback):
             "In the beginning",
         ]
 
-    def on_step_end(self, args, state, control, **kwargs):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # Only generate on the main process
+        if not args.local_process_index == 0:
+            return
+
         if state.global_step % self.eval_steps == 0:
             model = kwargs.get("model")
-            print("\n=== Generating samples ===")
-            for prompt in self.prompts:
-                inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
-                outputs = model.generate(
-                    **inputs,
-                    max_length=100,
-                    num_return_sequences=1,
-                    temperature=0.7,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
-                generated_text = self.tokenizer.decode(
-                    outputs[0], skip_special_tokens=True
-                )
-                print(f"\nPrompt: {prompt}")
-                print(f"Generated: {generated_text}")
-            print("\n========================\n")
+            if model is None:
+                return
+
+            model.eval()  # Set to evaluation mode
+            print(f"\n=== Generating samples at step {state.global_step} ===")
+            try:
+                with torch.no_grad():  # Disable gradient calculation
+                    for prompt in self.prompts:
+                        # Move input tensors to the same device as the model
+                        inputs = self.tokenizer(prompt, return_tensors="pt")
+                        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+                        outputs = model.generate(
+                            input_ids=inputs["input_ids"],
+                            attention_mask=inputs["attention_mask"],
+                            max_length=100,
+                            num_return_sequences=1,
+                            temperature=0.7,
+                            do_sample=True,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            eos_token_id=self.tokenizer.eos_token_id,
+                        )
+                        generated_text = self.tokenizer.decode(
+                            outputs[0], skip_special_tokens=True
+                        )
+                        print(f"\nPrompt: {prompt}")
+                        print(f"Generated: {generated_text}")
+            except Exception as e:
+                print(f"Generation failed with error: {str(e)}")
+                import traceback
+
+                print(traceback.format_exc())
+            finally:
+                print("\n========================\n")
+                model.train()  # Set back to training mode
+
+
+class CustomTrainer(Trainer):
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Override save_model to use our custom save_pretrained method."""
+        if output_dir is None:
+            output_dir = self.args.output_dir
+        self.model.save_pretrained(output_dir)
 
 
 def main(script_args: ScriptArguments, training_args: TrainingArguments):
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_built() else "cpu"
+    )
+    device = torch.device(device)
+    print("Using device:", device)
+
     # Load the tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(script_args.tokenizer_name)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(script_args.tokenizer_name)
+    except Exception as e:
+        print(f"Failed to load tokenizer {script_args.tokenizer_name}: {str(e)}")
+        print("Falling back to GPT-2 tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+
+    if tokenizer.pad_token is None:
+        # use the EOS token as the pad token
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.save_pretrained(training_args.output_dir)
+    total_vocab_size = len(tokenizer)
+    print(f"Total vocab size: {total_vocab_size}")
 
     # config = AutoConfig.from_pretrained(script_args.model_config)
     config = LlamaConfig(
-        vocab_size=128256,
+        vocab_size=total_vocab_size,
         hidden_size=1024,
         intermediate_size=4096,
         num_hidden_layers=12,
         num_attention_heads=16,
     )
-    model = LlamaForCausalLM(config)
-
-    if tokenizer.pad_token is None:
-        # use the EOS token as the pad token
-        tokenizer.pad_token = tokenizer.eos_token
+    model = LlamaForCausalLM(config, device=device)  # Pass device when creating model
 
     # Only print on the main process
     # Get the accelerator
-    accelerator = Accelerator()
     if accelerator.is_main_process:
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         trainable_params_in_billions = trainable_params / 1_000_000_000
@@ -98,10 +145,12 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments):
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     # Initialize the generation callback
-    generation_callback = GenerationCallback(tokenizer)
+    generation_callback = GenerationCallback(
+        tokenizer, eval_steps=training_args.eval_steps
+    )
 
-    # Initialize the Trainer
-    trainer = Trainer(
+    # Initialize the Trainer with our custom trainer class
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_datasets,
