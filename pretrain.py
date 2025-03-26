@@ -8,21 +8,20 @@ from transformers import (
 from datasets import load_dataset
 from transformers import DataCollatorForLanguageModeling
 from dataclasses import dataclass
-from accelerate import Accelerator
 import sys
 import os
 from transformers.trainer_callback import TrainerCallback
 import torch
+import json
 
 from model import LlamaForCausalLM, LlamaConfig
-
-accelerator = Accelerator()
 
 
 @dataclass
 class ScriptArguments:
     tokenizer_name: str
     dataset_name: str
+    max_length: int
 
 
 class GenerationCallback(TrainerCallback):
@@ -36,9 +35,6 @@ class GenerationCallback(TrainerCallback):
         ]
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        # Only generate on the main process
-        if not args.local_process_index == 0:
-            return
 
         if state.global_step % self.eval_steps == 0:
             model = kwargs.get("model")
@@ -57,7 +53,7 @@ class GenerationCallback(TrainerCallback):
                         outputs = model.generate(
                             input_ids=inputs["input_ids"],
                             attention_mask=inputs["attention_mask"],
-                            max_length=100,
+                            max_length=script_args.max_length,
                             num_return_sequences=1,
                             temperature=0.7,
                             do_sample=True,
@@ -79,30 +75,9 @@ class GenerationCallback(TrainerCallback):
                 model.train()  # Set back to training mode
 
 
-class CustomTrainer(Trainer):
-    def save_model(self, output_dir=None, _internal_call=False):
-        """Override save_model to use our custom save_pretrained method."""
-        if output_dir is None:
-            output_dir = self.args.output_dir
-        self.model.save_pretrained(output_dir)
-
-
 def main(script_args: ScriptArguments, training_args: TrainingArguments):
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps" if torch.backends.mps.is_built() else "cpu"
-    )
-    device = torch.device(device)
-    print("Using device:", device)
-
     # Load the tokenizer
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(script_args.tokenizer_name)
-    except Exception as e:
-        print(f"Failed to load tokenizer {script_args.tokenizer_name}: {str(e)}")
-        print("Falling back to GPT-2 tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained(script_args.tokenizer_name)
 
     if tokenizer.pad_token is None:
         # use the EOS token as the pad token
@@ -119,14 +94,22 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments):
         num_hidden_layers=12,
         num_attention_heads=16,
     )
-    model = LlamaForCausalLM(config, device=device)  # Pass device when creating model
+
+    # Save config as json instead of using save_pretrained
+    config_dict = (
+        config.model_dump()
+    )  # or config.dict() depending on your pydantic version
+    os.makedirs(training_args.output_dir, exist_ok=True)
+    with open(os.path.join(training_args.output_dir, "config.json"), "w") as f:
+        json.dump(config_dict, f, indent=2)
+
+    model = LlamaForCausalLM(config, tokenizer=tokenizer)
+    input("Press Enter to continue...")
 
     # Only print on the main process
-    # Get the accelerator
-    if accelerator.is_main_process:
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        trainable_params_in_billions = trainable_params / 1_000_000_000
-        print(f"Trainable parameters: {trainable_params_in_billions:.2f} billion")
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    trainable_params_in_billions = trainable_params / 1_000_000_000
+    print(f"Trainable parameters: {trainable_params_in_billions:.2f} billion")
 
     # Load your dataset
     dataset = load_dataset(
@@ -136,7 +119,10 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments):
     # Tokenize the dataset
     def tokenize_function(examples):
         inputs = tokenizer(
-            examples["text"], padding=False, truncation=True, max_length=512
+            examples["text"],
+            padding=True,
+            truncation=True,
+            max_length=script_args.max_length,
         )
         return inputs
 
@@ -150,7 +136,7 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments):
     )
 
     # Initialize the Trainer with our custom trainer class
-    trainer = CustomTrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_datasets,

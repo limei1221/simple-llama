@@ -30,8 +30,12 @@ class LlamaRMSNorm(nn.Module):
 
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states.to(
+            torch.float32
+        )  # torch.Size([batch_size, seq_length, hidden_size])
+        variance = hidden_states.pow(2).mean(
+            -1, keepdim=True
+        )  # torch.Size([batch_size, seq_length, 1])
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
@@ -115,16 +119,40 @@ class LlamaAttention(nn.Module):
         value_states = value_states.view(
             bsz, q_len, self.num_heads, self.head_dim
         ).transpose(1, 2)
+        # query_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
+        # key_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
+        # value_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
 
         cos, sin = self.rotary_emb(value_states, seq_len=q_len)
+        # cos.shape: torch.Size([1, 1, seq_length, head_dim])
+        # sin.shape: torch.Size([1, 1, seq_length, head_dim])
+
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin
         )
+        # query_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
+        # key_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
 
         attn_weights = (
             torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
         )
+        # attn_weights.shape: torch.Size([batch_size, num_heads, seq_length, seq_length])
 
+        # Create causal mask
+        seq_length = q_len
+        causal_mask = torch.triu(
+            torch.ones(
+                (seq_length, seq_length), dtype=torch.bool, device=attn_weights.device
+            ),
+            diagonal=1,
+        )
+        # Convert to float and replace True with -inf
+        causal_mask = causal_mask.float().masked_fill(causal_mask == 1, float("-inf"))
+
+        # Add causal mask to attention weights
+        attn_weights = attn_weights + causal_mask.unsqueeze(0).unsqueeze(0)
+
+        # Handle padding mask if provided
         if attention_mask is not None:
             if attention_mask.dim() == 2:
                 attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
@@ -132,15 +160,19 @@ class LlamaAttention(nn.Module):
                 attention_mask = attention_mask.unsqueeze(1)
 
             attention_mask = attention_mask.expand(-1, self.num_heads, -1, -1)
-            attn_weights = attn_weights + attention_mask
+            attn_weights = attn_weights.masked_fill(attention_mask == 0, float("-inf"))
 
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
             query_states.dtype
         )
         attn_output = torch.matmul(attn_weights, value_states)
+        # attn_output.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
         attn_output = attn_output.transpose(1, 2).contiguous()
+        # torch.Size([batch_size, seq_length, num_heads, head_dim])
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        # attn_output.shape: torch.Size([batch_size, seq_length, hidden_size])
         attn_output = self.o_proj(attn_output)
+        # attn_output.shape: torch.Size([batch_size, seq_length, hidden_size])
         return attn_output
 
 
@@ -226,9 +258,10 @@ class LlamaModel(nn.Module):
 
 
 class LlamaForCausalLM(nn.Module):
-    def __init__(self, config, device=None):
+    def __init__(self, config, tokenizer=None):
         super().__init__()
         self.config = config
+        self.tokenizer = tokenizer
         self.model = LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -236,11 +269,17 @@ class LlamaForCausalLM(nn.Module):
         self.apply(self._init_weights)
 
         # Share weights between embed_tokens and lm_head
-        self.lm_head.weight = self.model.embed_tokens.weight
+        # self.lm_head.weight = self.model.embed_tokens.weight
 
         self.loss_fct = nn.CrossEntropyLoss()
-        # Store device as an attribute
-        self.device = device if device is not None else torch.device("cpu")
+
+        device = (
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_built() else "cpu"
+        )
+        self.device = torch.device(device)
+        print("Using device:", self.device)
         # Move model to specified device
         self.to(self.device)
 
@@ -259,6 +298,10 @@ class LlamaForCausalLM(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         labels: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
+        # # print the decoded input_ids for debugging
+        # decoded_input_ids = [self.tokenizer.decode(id, skip_special_tokens=False) for id in input_ids[0]]
+        # print("Decoded input_ids:", ''.join(decoded_input_ids))
+
         hidden_states = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -269,6 +312,11 @@ class LlamaForCausalLM(nn.Module):
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+
+            # # print decoded shift_labels for debugging
+            # decoded_shift_labels = [self.tokenizer.decode(label, skip_special_tokens=False) for label in shift_labels[0]]
+            # print("Decoded shift_labels:", ''.join(decoded_shift_labels))
+
             # Add log_softmax before computing cross entropy
             loss = self.loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
@@ -398,23 +446,3 @@ class LlamaForCausalLM(nn.Module):
                 break
 
         return generated
-
-    def save_pretrained(self, save_dir: str):
-        """Save the model with proper handling of shared weights."""
-        os.makedirs(save_dir, exist_ok=True)
-
-        # Create a state dict with only unique weights
-        state_dict = {}
-        for name, param in self.named_parameters():
-            # Skip lm_head.weight since it's shared with embed_tokens
-            if name == "lm_head.weight":
-                continue
-            state_dict[name] = param.data
-
-        # Save the state dict
-        torch.save(state_dict, os.path.join(save_dir, "pytorch_model.bin"))
-
-        # Save the config
-        config_dict = self.config.model_dump()
-        with open(os.path.join(save_dir, "config.json"), "w") as f:
-            json.dump(config_dict, f, indent=2)
