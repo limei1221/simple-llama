@@ -178,7 +178,7 @@ class LlamaAttention(nn.Module):
             torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
         )
 
-        if is_prefix:
+        if (not use_cache) or is_prefix:
             # Apply causal mask only during prefill
             seq_length = q_len
             causal_mask = torch.triu(
@@ -203,18 +203,6 @@ class LlamaAttention(nn.Module):
                 attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
             elif attention_mask.dim() == 3:
                 attention_mask = attention_mask.unsqueeze(1)
-
-            # Expand attention mask to the right sequence length
-            if attention_mask.size(-1) != attn_weights.size(-1):
-                if is_prefix:
-                    attention_mask = attention_mask[:, :, :, : attn_weights.size(-1)]
-                else:
-                    # For generation, expand the mask to match cached sequence length
-                    attention_mask = F.pad(
-                        attention_mask,
-                        (0, attn_weights.size(-1) - attention_mask.size(-1)),
-                        value=1,
-                    )
 
             attention_mask = attention_mask.expand(-1, self.num_heads, -1, -1)
             attn_weights = attn_weights.masked_fill(attention_mask == 0, float("-inf"))
@@ -450,6 +438,19 @@ class LlamaForCausalLM(nn.Module):
             use_cache=True,
             is_prefix=True,
         )
+
+        # Add the attention mask to the generated sequence
+        attention_mask = torch.cat(
+                [
+                    attention_mask,
+                    torch.ones(
+                        (batch_size * num_return_sequences, 1),
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                ],
+                dim=1,
+            )
 
         for _ in range(max_length - input_ids.shape[1]):
             # Get next token logits

@@ -1,11 +1,11 @@
 #!/bin/bash
 set -e
 
-model_dir=/workspace/simple-llama/exp/Llama-3.2-0.3B_pretrain_fineweb/checkpoint-10000
+model_dir=/workspace/simple-llama/exp/Llama-3.2-0.3B_pretrain_fineweb_Rope_GQA
 
-cp /workspace/simple-llama/exp/Llama-3.2-0.3B_pretrain_fineweb/*.json $model_dir
+cp $model_dir/*.json $model_dir/checkpoint-10000/
 python inference.py \
-    --model_path $model_dir \
+    --model_path $model_dir/checkpoint-10000 \
     --prompt "Once upon a time, there was a cat." \
     --max_length 256 \
     --temperature 0.8 \
