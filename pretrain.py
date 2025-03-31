@@ -93,6 +93,7 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments):
         intermediate_size=4096,
         num_hidden_layers=12,
         num_attention_heads=16,
+        num_key_value_heads=4,
     )
 
     # Save config as json instead of using save_pretrained

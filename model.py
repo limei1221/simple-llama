@@ -16,6 +16,9 @@ class LlamaConfig(pydantic.BaseModel):
     max_position_embeddings: int = 2048
     pad_token_id: int = 0
     rms_norm_eps: float = 1e-6
+    num_key_value_heads: Optional[int] = (
+        None  # Will default to num_attention_heads ** 0.5 if not set
+    )
 
     def to_dict(self):
         """Convert the config to a dictionary."""
@@ -90,6 +93,12 @@ class LlamaAttention(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = (
+            config.num_key_value_heads
+            if config.num_key_value_heads is not None
+            else int(self.num_heads**0.5)
+        )
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.scaling = self.head_dim**-0.5
 
@@ -97,10 +106,10 @@ class LlamaAttention(nn.Module):
             self.hidden_size, self.num_heads * self.head_dim, bias=False
         )
         self.k_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=False
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.v_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=False
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
@@ -131,16 +140,29 @@ class LlamaAttention(nn.Module):
             bsz, q_len, self.num_heads, self.head_dim
         ).transpose(1, 2)
         key_states = key_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
+            bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
         value_states = value_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
+            bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
+        # query_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
+        # key_states.shape: torch.Size([batch_size, num_key_value_heads, seq_length, head_dim])
+        # value_states.shape: torch.Size([batch_size, num_key_value_heads, seq_length, head_dim])
+
+        key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        # query_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
+        # key_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
+        # value_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
 
         cos, sin = self.rotary_emb(value_states, seq_len=q_len)
+        # cos.shape: torch.Size([1, 1, seq_length, head_dim])
+        # sin.shape: torch.Size([1, 1, seq_length, head_dim])
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin
         )
+        # query_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
+        # key_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
 
         if use_cache:
             if is_prefix:
@@ -148,9 +170,7 @@ class LlamaAttention(nn.Module):
                 self.v_cache = value_states
             else:
                 key_states = torch.cat([self.k_cache, key_states], dim=2)
-                value_states = value_states = torch.cat(
-                    [self.v_cache, value_states], dim=2
-                )
+                value_states = torch.cat([self.v_cache, value_states], dim=2)
                 self.k_cache = key_states
                 self.v_cache = value_states
 
@@ -163,12 +183,16 @@ class LlamaAttention(nn.Module):
             seq_length = q_len
             causal_mask = torch.triu(
                 torch.ones(
-                    (seq_length, seq_length), dtype=torch.bool, device=attn_weights.device
+                    (seq_length, seq_length),
+                    dtype=torch.bool,
+                    device=attn_weights.device,
                 ),
                 diagonal=1,
             )
             # Convert to float and replace True with -inf
-            causal_mask = causal_mask.float().masked_fill(causal_mask == 1, float("-inf"))
+            causal_mask = causal_mask.float().masked_fill(
+                causal_mask == 1, float("-inf")
+            )
 
             # Add causal mask to attention weights
             attn_weights = attn_weights + causal_mask.unsqueeze(0).unsqueeze(0)
