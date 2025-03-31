@@ -110,11 +110,16 @@ class LlamaAttention(nn.Module):
             self.head_dim, config.max_position_embeddings
         )
 
+        self.k_cache = None
+        self.v_cache = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        use_cache: bool = False,
+        is_prefix: bool = False,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -131,45 +136,61 @@ class LlamaAttention(nn.Module):
         value_states = value_states.view(
             bsz, q_len, self.num_heads, self.head_dim
         ).transpose(1, 2)
-        # query_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
-        # key_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
-        # value_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
 
         cos, sin = self.rotary_emb(value_states, seq_len=q_len)
-        # cos.shape: torch.Size([1, 1, seq_length, head_dim])
-        # sin.shape: torch.Size([1, 1, seq_length, head_dim])
-
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin
         )
-        # query_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
-        # key_states.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
+
+        if use_cache:
+            if is_prefix:
+                self.k_cache = key_states
+                self.v_cache = value_states
+            else:
+                key_states = torch.cat([self.k_cache, key_states], dim=2)
+                value_states = value_states = torch.cat(
+                    [self.v_cache, value_states], dim=2
+                )
+                self.k_cache = key_states
+                self.v_cache = value_states
 
         attn_weights = (
             torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
         )
-        # attn_weights.shape: torch.Size([batch_size, num_heads, seq_length, seq_length])
 
-        # Create causal mask
-        seq_length = q_len
-        causal_mask = torch.triu(
-            torch.ones(
-                (seq_length, seq_length), dtype=torch.bool, device=attn_weights.device
-            ),
-            diagonal=1,
-        )
-        # Convert to float and replace True with -inf
-        causal_mask = causal_mask.float().masked_fill(causal_mask == 1, float("-inf"))
+        if is_prefix:
+            # Apply causal mask only during prefill
+            seq_length = q_len
+            causal_mask = torch.triu(
+                torch.ones(
+                    (seq_length, seq_length), dtype=torch.bool, device=attn_weights.device
+                ),
+                diagonal=1,
+            )
+            # Convert to float and replace True with -inf
+            causal_mask = causal_mask.float().masked_fill(causal_mask == 1, float("-inf"))
 
-        # Add causal mask to attention weights
-        attn_weights = attn_weights + causal_mask.unsqueeze(0).unsqueeze(0)
+            # Add causal mask to attention weights
+            attn_weights = attn_weights + causal_mask.unsqueeze(0).unsqueeze(0)
 
-        # Handle padding mask if provided
         if attention_mask is not None:
+            # Adjust attention mask to match the sequence length of attention weights
             if attention_mask.dim() == 2:
                 attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
             elif attention_mask.dim() == 3:
                 attention_mask = attention_mask.unsqueeze(1)
+
+            # Expand attention mask to the right sequence length
+            if attention_mask.size(-1) != attn_weights.size(-1):
+                if is_prefix:
+                    attention_mask = attention_mask[:, :, :, : attn_weights.size(-1)]
+                else:
+                    # For generation, expand the mask to match cached sequence length
+                    attention_mask = F.pad(
+                        attention_mask,
+                        (0, attn_weights.size(-1) - attention_mask.size(-1)),
+                        value=1,
+                    )
 
             attention_mask = attention_mask.expand(-1, self.num_heads, -1, -1)
             attn_weights = attn_weights.masked_fill(attention_mask == 0, float("-inf"))
@@ -178,13 +199,9 @@ class LlamaAttention(nn.Module):
             query_states.dtype
         )
         attn_output = torch.matmul(attn_weights, value_states)
-        # attn_output.shape: torch.Size([batch_size, num_heads, seq_length, head_dim])
         attn_output = attn_output.transpose(1, 2).contiguous()
-        # torch.Size([batch_size, seq_length, num_heads, head_dim])
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-        # attn_output.shape: torch.Size([batch_size, seq_length, hidden_size])
         attn_output = self.o_proj(attn_output)
-        # attn_output.shape: torch.Size([batch_size, seq_length, hidden_size])
         return attn_output
 
 
@@ -219,6 +236,8 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        use_cache: bool = False,
+        is_prefix: bool = False,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -226,6 +245,8 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            use_cache=use_cache,
+            is_prefix=is_prefix,
         )
         hidden_states = residual + hidden_states
         residual = hidden_states
@@ -255,6 +276,8 @@ class LlamaModel(nn.Module):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        use_cache: bool = False,
+        is_prefix: bool = False,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
 
@@ -263,6 +286,8 @@ class LlamaModel(nn.Module):
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                use_cache=use_cache,
+                is_prefix=is_prefix,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -309,25 +334,21 @@ class LlamaForCausalLM(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        use_cache: bool = False,
+        is_prefix: bool = False,
     ) -> torch.Tensor:
-        # # print the decoded input_ids for debugging
-        # decoded_input_ids = [self.tokenizer.decode(id, skip_special_tokens=False) for id in input_ids[0]]
-        # print("Decoded input_ids:", ''.join(decoded_input_ids))
-
         hidden_states = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            use_cache=use_cache,
+            is_prefix=is_prefix,
         )
         logits = self.lm_head(hidden_states)
 
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-
-            # # print decoded shift_labels for debugging
-            # decoded_shift_labels = [self.tokenizer.decode(label, skip_special_tokens=False) for label in shift_labels[0]]
-            # print("Decoded shift_labels:", ''.join(decoded_shift_labels))
 
             # Add log_softmax before computing cross entropy
             loss = self.loss_fct(
@@ -393,14 +414,21 @@ class LlamaForCausalLM(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
 
-        for _ in range(max_length - input_ids.shape[1]):
-            # Get model predictions
-            outputs = self(
-                input_ids=generated,
-                attention_mask=attention_mask,
-            )
+        # Clear KV cache in all attention layers
+        for layer in self.model.layers:
+            layer.self_attn.k_cache = None
+            layer.self_attn.v_cache = None
 
-            # Extract logits from the outputs dictionary
+        # Prefill phase - process the entire prompt
+        outputs = self(
+            input_ids=generated,
+            attention_mask=attention_mask,
+            use_cache=True,
+            is_prefix=True,
+        )
+
+        for _ in range(max_length - input_ids.shape[1]):
+            # Get next token logits
             next_token_logits = outputs["logits"][:, -1, :] / temperature
 
             if do_sample:
@@ -436,6 +464,14 @@ class LlamaForCausalLM(nn.Module):
             else:
                 # Greedy decoding
                 next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+            # Process single new token with cached KV
+            outputs = self(
+                input_ids=next_token,
+                attention_mask=attention_mask,
+                use_cache=True,
+                is_prefix=False,
+            )
 
             # Append the next token to the generated sequence
             generated = torch.cat([generated, next_token], dim=1)
