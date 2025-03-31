@@ -104,7 +104,6 @@ def main(script_args: ScriptArguments, training_args: TrainingArguments):
         json.dump(config_dict, f, indent=2)
 
     model = LlamaForCausalLM(config, tokenizer=tokenizer)
-    input("Press Enter to continue...")
 
     # Only print on the main process
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

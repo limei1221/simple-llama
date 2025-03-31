@@ -50,7 +50,8 @@ class LlamaRotaryEmbedding(nn.Module):
             self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
         )
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
+        # emb = torch.cat((freqs, freqs), dim=-1)
+        emb = freqs.repeat_interleave(2, dim=1)
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :])
 
@@ -61,15 +62,26 @@ class LlamaRotaryEmbedding(nn.Module):
         )
 
 
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+def rotate_pairs(x):
+    # Save original shape and flatten all dimensions except last
+    orig_shape = x.shape
+    x_flat = x.reshape(-1, x.shape[-1])
+
+    # Reshape last dim into pairs
+    pairs = x_flat.view(x_flat.shape[0], -1, 2)
+
+    # Create output tensor and perform rotation
+    rearranged = torch.empty_like(pairs)
+    rearranged[..., 0] = -pairs[..., 1]
+    rearranged[..., 1] = pairs[..., 0]
+
+    # Restore original shape
+    return rearranged.reshape(orig_shape)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = (q * cos) + (rotate_pairs(q) * sin)
+    k_embed = (k * cos) + (rotate_pairs(k) * sin)
     return q_embed, k_embed
 
 
